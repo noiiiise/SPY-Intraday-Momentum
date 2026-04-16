@@ -245,7 +245,7 @@ plt.show()
 # Calculate additional stats and display them
 stats = {
     'Total Return (%)': round((np.prod(1 + strat['ret'].dropna()) - 1) * 100, 0),
-    'Annualized Return (%)': round((np.prod(1 + strat['ret']) ** (252 / len(strat['ret'])) - 1) * 100, 1),
+    'Annualized Return (%)': round((np.prod(1 + strat['ret'].dropna()) ** (252 / len(strat['ret'].dropna())) - 1) * 100, 1),
     'Annualized Volatility (%)': round(strat['ret'].dropna().std() * np.sqrt(252) * 100, 1),
     'Sharpe Ratio': round(strat['ret'].dropna().mean() / strat['ret'].dropna().std() * np.sqrt(252), 2),
     'Hit Ratio (%)': round((strat['ret'] > 0).sum() / (strat['ret'].abs() > 0).sum() * 100, 0),
@@ -253,8 +253,9 @@ stats = {
 }
 
 
-Y = strat['ret'].dropna()
-X = sm.add_constant(strat['ret_spy'].dropna())
+aligned = pd.concat([strat['ret'], strat['ret_spy']], axis=1).dropna()
+Y = aligned['ret']
+X = sm.add_constant(aligned['ret_spy'])
 model = sm.OLS(Y, X).fit()
 stats['Alpha (%)'] = round(model.params.const * 100 * 252, 2)
 stats['Beta'] = round(model.params['ret_spy'], 2)
