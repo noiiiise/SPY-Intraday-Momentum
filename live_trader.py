@@ -35,7 +35,8 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-# ─── Strategy Parameters (match the backtested paper exactly) ────────────────
+# ─── Strategy Parameters (defaults from the Zarattini paper) ─────────────────
+# These may be overridden by params.json (written by post_session_analyzer.py)
 SYMBOL           = 'SPY'
 TRADE_FREQ_MIN   = 30        # Evaluate signal every N minutes
 BAND_MULT        = 1.0       # Band multiplier (1× sigma_open)
@@ -47,6 +48,24 @@ MIN_COMMISSION   = 0.35      # Min commission per order
 SIGMA_LOOKBACK   = 14        # Rolling window (days) for sigma_open
 VOL_LOOKBACK     = 15        # Rolling window (days) for daily vol
 HIST_DAYS        = 50        # Calendar days of history to fetch pre-market
+DAILY_TP_PCT     = 0.20      # Take profit: exit all if daily P&L hits +20%
+
+# ─── Load Adaptive Parameters (from learning pipeline) ───────────────────────
+import json
+PARAMS_FILE = Path(__file__).parent / 'params.json'
+if PARAMS_FILE.exists():
+    try:
+        _p = json.load(open(PARAMS_FILE))
+        if 'params' in _p:
+            _p = _p['params']
+        BAND_MULT        = _p.get('BAND_MULT', BAND_MULT)
+        TARGET_VOL       = _p.get('TARGET_VOL', TARGET_VOL)
+        MAX_LEVERAGE     = _p.get('MAX_LEVERAGE', MAX_LEVERAGE)
+        OVERNIGHT_THRESH = _p.get('OVERNIGHT_THRESH', OVERNIGHT_THRESH)
+        SIGMA_LOOKBACK   = int(_p.get('SIGMA_LOOKBACK', SIGMA_LOOKBACK))
+        VOL_LOOKBACK     = int(_p.get('VOL_LOOKBACK', VOL_LOOKBACK))
+    except Exception:
+        pass  # Fall back to defaults if params.json is corrupted
 
 ET = pytz.timezone('America/New_York')
 
@@ -118,6 +137,8 @@ class SPYIntradayTrader:
         self.mrp_exited     = False  # Flag: MRP already closed today
         self.signal_log     = []     # Intraday signal history
         self.last_check_min = -1     # Prevent double-firing at same minute
+        self.start_aum      = self.aum  # Snapshot AUM at session start for TP calc
+        self.tp_triggered   = False  # Flag: daily take-profit hit
 
         log.info(f"Trader initialized | Paper AUM: ${self.aum:,.2f}")
         log.info(f"Strategy params: BAND_MULT={BAND_MULT}, TARGET_VOL={TARGET_VOL}, "
@@ -301,7 +322,9 @@ class SPYIntradayTrader:
 
         self.open_price   = float(df['open'].iloc[0])
         self.aum          = self._get_portfolio_value()
+        self.start_aum    = self.aum   # Snapshot for take-profit calculation
         self.mrp_exited   = False
+        self.tp_triggered = False
         self.last_check_min = -1
 
         ovn_move = (self.open_price / self.prev_close) - 1
@@ -367,6 +390,52 @@ class SPYIntradayTrader:
         hlc = (df['high'] + df['low'] + df['close']) / 3
         return float((hlc * df['volume']).sum() / df['volume'].sum())
 
+    def _check_daily_take_profit(self) -> bool:
+        """
+        Check if daily P&L has hit +20%. If so, close everything and stop trading.
+        Returns True if take-profit triggered (caller should skip further signals).
+        """
+        if self.tp_triggered:
+            return True
+
+        current_aum = self._get_portfolio_value()
+        daily_pnl_pct = (current_aum - self.start_aum) / self.start_aum
+
+        if daily_pnl_pct >= DAILY_TP_PCT:
+            log.info("!" * 60)
+            log.info(f"DAILY TAKE-PROFIT TRIGGERED: +{daily_pnl_pct*100:.1f}% "
+                     f"(${current_aum - self.start_aum:+,.2f})")
+            log.info(f"Start AUM: ${self.start_aum:,.2f} → Current: ${current_aum:,.2f}")
+            log.info("Closing all positions and halting trading for today.")
+            log.info("!" * 60)
+
+            if self.imp_shares != 0:
+                self._adjust_to_target(0, 'IMP-TP')
+                self.imp_shares = 0
+            if self.mrp_shares != 0:
+                self._adjust_to_target(0, 'MRP-TP')
+                self.mrp_shares = 0
+
+            self.tp_triggered = True
+            self.aum = self._get_portfolio_value()
+
+            self.signal_log.append({
+                'timestamp'  : now_et().isoformat(),
+                'check_min'  : -1,
+                'close'      : 0,
+                'vwap'       : 0,
+                'ub'         : 0,
+                'lb'         : 0,
+                'sigma'      : 0,
+                'signal'     : 99,  # Special code for take-profit
+                'imp_shares' : 0,
+                'mrp_shares' : 0,
+                'aum'        : round(self.aum, 2),
+            })
+            return True
+
+        return False
+
     def _imp_signal_check(self, check_min: int):
         """
         Core IMP logic. Evaluate signal at check_min and adjust position.
@@ -379,6 +448,11 @@ class SPYIntradayTrader:
         UB = max(open, prev_close) × (1 + sigma_open)
         LB = min(open, prev_close) × (1 - sigma_open)
         """
+        # Check take-profit before evaluating signals
+        if self._check_daily_take_profit():
+            log.info("IMP check skipped: daily take-profit already triggered")
+            return
+
         if self.open_price is None or self.prev_close is None:
             log.warning("IMP check skipped: open_price or prev_close not set")
             return
