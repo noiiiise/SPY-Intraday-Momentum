@@ -8,11 +8,13 @@ import matplotlib.dates as mdates
 from   matplotlib.ticker import FuncFormatter
 import statsmodels.api as sm
 import pytz
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
 
-API_KEY_ID     = "KEY"
-API_SECRET_KEY = "SECRET"
-#rMSa7gZ510pIaKtkFoabdDxT3WmfSVW9gZ
+API_KEY_ID     = os.getenv('ALPACA_API_KEY')
+API_SECRET_KEY = os.getenv('ALPACA_API_SECRET')
 
 
 def fetch_alpaca_data(symbol, timeframe, start_date, end_date) -> pd.DataFrame:
